@@ -12,6 +12,7 @@ Author: Triệu Tử Long
 
 import asyncio
 import argparse
+import json
 import logging
 import math
 import os
@@ -22,7 +23,7 @@ import ccxt.async_support as ccxt
 import numpy as np
 import pandas as pd
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Bot
+from telegram import Bot, ReplyKeyboardMarkup, KeyboardButton
 
 from env_loader import load_env_file
 
@@ -32,7 +33,18 @@ from env_loader import load_env_file
 load_env_file(Path(__file__).resolve().parent / ".env")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+ADMIN_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+SUBSCRIBERS_FILE = Path(
+    os.getenv(
+        "TELEGRAM_SUBSCRIBERS_FILE",
+        Path(__file__).resolve().parent / "telegram_subscribers.json",
+    )
+)
+SEEDED_BROADCAST_CHAT_IDS = tuple(
+    chat_id.strip()
+    for chat_id in os.getenv("TELEGRAM_BROADCAST_CHAT_IDS", "").split(",")
+    if chat_id.strip()
+)
 
 # Tham số kỹ thuật
 EMA_4H_PERIOD = 34
@@ -47,6 +59,7 @@ ALT_RANGE_PERCENT_MIN = 0.05   # Nhánh bổ sung: Range từ 5% đến 10%
 ALT_VOLUME_SPIKE_MULTIPLIER = 3.0  # Nhánh bổ sung: Volume >= 3x nến trước
 ALT_BODY_RATIO_MIN = 0.80      # Nhánh 5-10%: Body >= 80% tổng chiều dài nến
 MIN_FUTURES_QUOTE_VOLUME_24H = 5_000_000   # 24h quote volume tối thiểu (USDT)
+PREVIOUS_H4_GREEN_RANGE_MAX = 0.045        # Filter cho H4 liền kề trước đó
 
 # Điều kiện tổng hợp D1 lúc 07:00 UTC+7 (tức 00:00 UTC)
 D1_BODY_RATIO_MIN = 0.60       # Body > 60% tổng chiều dài nến D1
@@ -66,6 +79,7 @@ log = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 exchange: ccxt.binance | None = None
 bot: Bot | None = None
+subscriber_registry: dict[str, list[str]] = {"private_chats": [], "group_chats": []}
 
 
 def create_exchange() -> ccxt.binance:
@@ -81,14 +95,20 @@ def create_exchange() -> ccxt.binance:
 
 async def init():
     """Khởi tạo exchange và Telegram bot."""
-    global exchange, bot
-    if not TELEGRAM_TOKEN or not CHAT_ID:
+    global exchange, bot, subscriber_registry
+    if not TELEGRAM_TOKEN:
         raise RuntimeError(
-            "Thiếu TELEGRAM_TOKEN hoặc TELEGRAM_CHAT_ID trong biến môi trường."
+            "Thiếu TELEGRAM_TOKEN trong biến môi trường."
         )
     exchange = create_exchange()
     bot = Bot(token=TELEGRAM_TOKEN)
+    subscriber_registry = load_subscriber_registry()
     log.info("Exchange và Telegram Bot đã khởi tạo.")
+    log.info(
+        "Đã nạp subscriber registry | private=%s | groups=%s",
+        len(subscriber_registry["private_chats"]),
+        len(subscriber_registry["group_chats"]),
+    )
 
 
 async def shutdown():
@@ -97,6 +117,315 @@ async def shutdown():
     if exchange:
         await exchange.close()
         log.info("Exchange closed.")
+
+
+def normalize_chat_id(chat_id: object) -> str:
+    """Chuẩn hoá chat id để lưu trữ và so sánh nhất quán."""
+    return str(chat_id).strip()
+
+
+def empty_subscriber_registry() -> dict[str, list[str]]:
+    return {"private_chats": [], "group_chats": []}
+
+
+def load_subscriber_registry() -> dict[str, list[str]]:
+    if not SUBSCRIBERS_FILE.exists():
+        return empty_subscriber_registry()
+
+    try:
+        payload = json.loads(SUBSCRIBERS_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning(f"Không đọc được subscriber registry: {e}")
+        return empty_subscriber_registry()
+
+    registry = empty_subscriber_registry()
+    for key in registry:
+        values = payload.get(key, [])
+        if isinstance(values, list):
+            registry[key] = sorted(
+                {
+                    normalize_chat_id(chat_id)
+                    for chat_id in values
+                    if normalize_chat_id(chat_id)
+                }
+            )
+    return registry
+
+
+def save_subscriber_registry(registry: dict[str, list[str]]) -> None:
+    payload = {
+        "private_chats": sorted({normalize_chat_id(chat_id) for chat_id in registry["private_chats"]}),
+        "group_chats": sorted({normalize_chat_id(chat_id) for chat_id in registry["group_chats"]}),
+    }
+    SUBSCRIBERS_FILE.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def add_chat_to_registry(registry: dict[str, list[str]], key: str, chat_id: object) -> bool:
+    normalized = normalize_chat_id(chat_id)
+    if not normalized:
+        return False
+    if normalized in registry[key]:
+        return False
+    registry[key].append(normalized)
+    registry[key].sort()
+    return True
+
+
+def remove_chat_from_registry(registry: dict[str, list[str]], key: str, chat_id: object) -> bool:
+    normalized = normalize_chat_id(chat_id)
+    if normalized not in registry[key]:
+        return False
+    registry[key].remove(normalized)
+    return True
+
+
+def get_broadcast_chat_ids() -> list[str]:
+    """Lấy danh sách nhận tín hiệu từ registry và file seed."""
+    recipients = {
+        *subscriber_registry["private_chats"],
+        *subscriber_registry["group_chats"],
+        *SEEDED_BROADCAST_CHAT_IDS,
+    }
+    recipients.discard("")
+    return sorted(recipients)
+
+
+async def reply_message(chat_id: object, message: str, reply_markup=None) -> None:
+    try:
+        tg_bot = bot
+        assert tg_bot is not None
+        await tg_bot.send_message(chat_id=chat_id, text=message, reply_markup=reply_markup)
+    except Exception as e:
+        log.error(f"Không thể phản hồi chat {chat_id}: {e}")
+
+
+def get_private_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton("Đăng ký nhận tín hiệu"), KeyboardButton("Hủy đăng ký")],
+        [KeyboardButton("Trạng thái của tôi"), KeyboardButton("Danh sách lệnh")],
+        [KeyboardButton("Thông tin chiến lược")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+def get_group_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton("Bật tín hiệu cho nhóm"), KeyboardButton("Tắt tín hiệu cho nhóm")],
+        [KeyboardButton("Trạng thái nhóm"), KeyboardButton("Danh sách lệnh")],
+        [KeyboardButton("Thông tin chiến lược")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+async def handle_private_command(chat_id: str, command_text: str) -> None:
+    is_admin = chat_id == normalize_chat_id(ADMIN_CHAT_ID)
+    cmd = command_text.lower()
+    
+    if cmd in {"/start", "/register", "/subscribe", "đăng ký nhận tín hiệu"}:
+        added = add_chat_to_registry(subscriber_registry, "private_chats", chat_id)
+        save_subscriber_registry(subscriber_registry)
+        if added:
+            msg = "✅ Đăng ký thành công.\nBạn sẽ nhận tín hiệu ở các lần quét tiếp theo."
+        else:
+            msg = "ℹ️ Bạn đã đăng ký nhận tín hiệu từ trước."
+        await reply_message(chat_id, msg, reply_markup=get_private_keyboard())
+        return
+
+    if cmd in {"/stop", "/unregister", "/unsubscribe", "hủy đăng ký"}:
+        removed = remove_chat_from_registry(subscriber_registry, "private_chats", chat_id)
+        save_subscriber_registry(subscriber_registry)
+        if removed:
+            msg = "✅ Đã hủy đăng ký nhận tín hiệu."
+        else:
+            msg = "ℹ️ Bạn hiện chưa đăng ký nhận tín hiệu."
+        await reply_message(chat_id, msg, reply_markup=get_private_keyboard())
+        return
+
+    if cmd in {"/status", "trạng thái của tôi"}:
+        if chat_id in subscriber_registry["private_chats"]:
+            msg = "✅ Trạng thái: Đang nhận tín hiệu."
+        else:
+            msg = "❌ Trạng thái: Chưa đăng ký nhận tín hiệu."
+        await reply_message(chat_id, msg, reply_markup=get_private_keyboard())
+        return
+        
+    if cmd in {"/help", "danh sách lệnh"}:
+        msg = (
+            "Danh sách lệnh hỗ trợ:\n"
+            "- Đăng ký nhận tín hiệu (/register)\n"
+            "- Hủy đăng ký (/unregister)\n"
+            "- Trạng thái của tôi (/status)\n"
+            "- Thông tin chiến lược (/strategy)\n"
+            "- Danh sách lệnh (/help)"
+        )
+        await reply_message(chat_id, msg, reply_markup=get_private_keyboard())
+        return
+
+    if cmd in {"/strategy", "thông tin chiến lược"}:
+        msg = (
+            "Bot quét toàn bộ USDT-M Futures trên Binance.\n\n"
+            "Khung chính: H4\n"
+            "Khung xác nhận: M30\n\n"
+            "LONG:\n"
+            "* Nến H4 vừa đóng là nến xanh\n"
+            "* Nến đạt điều kiện body, range, volume\n"
+            "* Close H4 nằm trên EMA34\n"
+            "* Giá M30 nằm trên EMA89, EMA144, EMA257\n\n"
+            "SHORT:\n"
+            "* Nến H4 vừa đóng là nến đỏ\n"
+            "* Nến đạt điều kiện body, range, volume\n"
+            "* Close H4 nằm dưới EMA34\n"
+            "* Giá M30 nằm dưới EMA89, EMA144, EMA257\n\n"
+            "Khi có tín hiệu hợp lệ, bot gửi Entry, SL, TP1, TP2.\n\n"
+            "Bot cũng gửi tổng hợp D1 mỗi ngày vào 07:00 UTC+7 nếu được cấu hình scheduler."
+        )
+        await reply_message(chat_id, msg, reply_markup=get_private_keyboard())
+        return
+
+    if cmd in {"/listsubscribers", "/subscribers"}:
+        if is_admin:
+            private_count = len(subscriber_registry["private_chats"])
+            group_count = len(subscriber_registry["group_chats"])
+            private_list = "\n- ".join(subscriber_registry["private_chats"]) if private_count > 0 else "Không có"
+            group_list = "\n- ".join(subscriber_registry["group_chats"]) if group_count > 0 else "Không có"
+            msg = (
+                f"Tổng số private subscriber: {private_count}\n"
+                f"Tổng số group subscriber: {group_count}\n\n"
+                f"Danh sách chat id private:\n- {private_list}\n\n"
+                f"Danh sách chat id group:\n- {group_list}"
+            )
+            await reply_message(chat_id, msg, reply_markup=get_private_keyboard())
+        else:
+            await reply_message(chat_id, "❌ Bạn không có quyền dùng lệnh này.", reply_markup=get_private_keyboard())
+        return
+
+    if cmd.startswith("/"):
+        await reply_message(chat_id, "Lệnh không hợp lệ. Vui lòng chọn từ menu.", reply_markup=get_private_keyboard())
+
+
+async def handle_group_command(chat_id: str, command_text: str) -> None:
+    cmd = command_text.lower()
+    
+    if cmd in {"/start", "/enablegroup", "/registergroup", "/subscribegroup", "bật tín hiệu cho nhóm"}:
+        added = add_chat_to_registry(subscriber_registry, "group_chats", chat_id)
+        save_subscriber_registry(subscriber_registry)
+        if added:
+            msg = "✅ Nhóm đã được bật nhận tín hiệu."
+        else:
+            msg = "ℹ️ Nhóm này đã nằm trong danh sách nhận tín hiệu."
+        await reply_message(chat_id, msg, reply_markup=get_group_keyboard())
+        return
+
+    if cmd in {"/disablegroup", "/unregistergroup", "/unsubscribegroup", "tắt tín hiệu cho nhóm"}:
+        removed = remove_chat_from_registry(subscriber_registry, "group_chats", chat_id)
+        save_subscriber_registry(subscriber_registry)
+        if removed:
+            msg = "✅ Nhóm đã được tắt nhận tín hiệu."
+        else:
+            msg = "ℹ️ Nhóm này hiện chưa nằm trong danh sách nhận tín hiệu."
+        await reply_message(chat_id, msg, reply_markup=get_group_keyboard())
+        return
+
+    if cmd in {"/status", "trạng thái nhóm"}:
+        if chat_id in subscriber_registry["group_chats"]:
+            msg = "✅ Trạng thái nhóm: Đang nhận tín hiệu."
+        else:
+            msg = "❌ Trạng thái nhóm: Chưa bật nhận tín hiệu."
+        await reply_message(chat_id, msg, reply_markup=get_group_keyboard())
+        return
+        
+    if cmd in {"/help", "danh sách lệnh"}:
+        msg = (
+            "Danh sách lệnh hỗ trợ:\n"
+            "- Bật tín hiệu cho nhóm (/enablegroup)\n"
+            "- Tắt tín hiệu cho nhóm (/disablegroup)\n"
+            "- Trạng thái nhóm (/status)\n"
+            "- Thông tin chiến lược (/strategy)\n"
+            "- Danh sách lệnh (/help)"
+        )
+        await reply_message(chat_id, msg, reply_markup=get_group_keyboard())
+        return
+        
+    if cmd in {"/strategy", "thông định chiến lược", "thông tin chiến lược"}:
+        msg = (
+            "Bot quét toàn bộ USDT-M Futures trên Binance.\n\n"
+            "Khung chính: H4\n"
+            "Khung xác nhận: M30\n\n"
+            "LONG:\n"
+            "* Nến H4 vừa đóng là nến xanh\n"
+            "* Nến đạt điều kiện body, range, volume\n"
+            "* Close H4 nằm trên EMA34\n"
+            "* Giá M30 nằm trên EMA89, EMA144, EMA257\n\n"
+            "SHORT:\n"
+            "* Nến H4 vừa đóng là nến đỏ\n"
+            "* Nến đạt điều kiện body, range, volume\n"
+            "* Close H4 nằm dưới EMA34\n"
+            "* Giá M30 nằm dưới EMA89, EMA144, EMA257\n\n"
+            "Khi có tín hiệu hợp lệ, bot gửi Entry, SL, TP1, TP2.\n\n"
+            "Bot cũng gửi tổng hợp D1 mỗi ngày vào 07:00 UTC+7 nếu được cấu hình scheduler."
+        )
+        await reply_message(chat_id, msg, reply_markup=get_group_keyboard())
+        return
+
+
+async def sync_telegram_subscribers() -> None:
+    """Đọc các lệnh Telegram chờ xử lý và cập nhật registry subscriber."""
+    tg_bot = bot
+    assert tg_bot is not None
+
+    try:
+        updates = await tg_bot.get_updates(timeout=0, allowed_updates=["message"], limit=100)
+    except Exception as e:
+        log.error(f"Không thể đồng bộ Telegram updates: {e}")
+        return
+
+    if not updates:
+        return
+
+    processed = 0
+    last_update_id = max(update.update_id for update in updates)
+
+    for update in updates:
+        try:
+            message = update.message
+            if message is None or not message.text:
+                continue
+
+            text = message.text.strip()
+            if text.startswith("/"):
+                command_text = text.split()[0].split("@")[0].lower()
+            else:
+                command_text = text
+
+            chat_id = normalize_chat_id(message.chat.id)
+            chat_type = message.chat.type
+
+            log.info(f"Nhận command '{command_text}' từ chat {chat_id} ({chat_type})")
+
+            if chat_type == "private":
+                await handle_private_command(chat_id, command_text)
+                processed += 1
+            elif chat_type in {"group", "supergroup"}:
+                await handle_group_command(chat_id, command_text)
+                processed += 1
+        except Exception as e:
+            log.error(f"Lỗi khi xử lý update {update.update_id}: {e}")
+
+    try:
+        await tg_bot.get_updates(
+            offset=last_update_id + 1,
+            timeout=0,
+            allowed_updates=["message"],
+            limit=1,
+        )
+    except Exception as e:
+        log.warning(f"Không thể xác nhận Telegram updates: {e}")
+
+    if processed > 0:
+        log.info(f"Đã xử lý {processed} Telegram command(s).")
 
 
 # ──────────────────────────────────────────────
@@ -204,10 +533,39 @@ def passes_directional_wick_rule(o: float, h: float, l: float, c: float) -> bool
     return (lower_wick / total_range) <= WICK_RATIO_MAX
 
 
+def passes_previous_h4_candle_filter(
+    prev_open: float,
+    prev_high: float,
+    prev_low: float,
+    prev_close: float,
+) -> bool:
+    """
+    Kiểm tra nến H4 liền kề trước đó.
+    1. Đỏ (close < open): hợp lệ.
+    2. Xanh (close > open): hợp lệ nếu range <= 4.5%.
+    3. Doji (close == open): không hợp lệ.
+    """
+    if prev_open <= 0:
+        return False
+
+    prev_range_pct = (prev_high - prev_low) / prev_open
+
+    # Nến trước đỏ: hợp lệ luôn
+    if prev_close < prev_open:
+        return True
+
+    # Nến trước xanh: chỉ hợp lệ nếu range <= 4.5%
+    if prev_close > prev_open:
+        return prev_range_pct <= PREVIOUS_H4_GREEN_RANGE_MAX
+
+    # Doji: không hợp lệ
+    return False
+
+
 # ──────────────────────────────────────────────
 # KIỂM TRA ĐIỀU KIỆN NẾN 4H
 # ──────────────────────────────────────────────
-def check_candle_conditions(df_4h: pd.DataFrame) -> dict | None:
+def check_candle_conditions(df_4h: pd.DataFrame, symbol: str = "") -> dict | None:
     """
     Kiểm tra điều kiện trên nến 4H vừa đóng (iloc[-2]).
     Range được tính theo chiều dài nến từ thấp nhất đến cao nhất: (High - Low) / Open.
@@ -221,6 +579,10 @@ def check_candle_conditions(df_4h: pd.DataFrame) -> dict | None:
     prev_candle = df_4h.iloc[-3]
 
     o, h, l, c, vol = candle["open"], candle["high"], candle["low"], candle["close"], candle["volume"]
+    prev_o = prev_candle["open"]
+    prev_h = prev_candle["high"]
+    prev_l = prev_candle["low"]
+    prev_c = prev_candle["close"]
     prev_vol = prev_candle["volume"]
 
     total_range = h - l
@@ -265,6 +627,16 @@ def check_candle_conditions(df_4h: pd.DataFrame) -> dict | None:
 
     # Xác định bullish / bearish
     is_bullish = c > o
+
+    # Lọc nến H4 liền trước (Reversal filter)
+    if not passes_previous_h4_candle_filter(prev_o, prev_h, prev_l, prev_c):
+        symbol_prefix = f"{symbol}: " if symbol else ""
+        log.info(
+            f"Rejected {symbol_prefix}previous H4 candle filter failed | "
+            f"prev_open={prev_o} prev_high={prev_h} prev_low={prev_l} prev_close={prev_c} "
+            f"prev_range_pct={(prev_h - prev_l) / prev_o:.2%}"
+        )
+        return None
 
     return {
         "open": o,
@@ -458,14 +830,26 @@ def format_daily_summary(long_coins: list[str], short_coins: list[str]) -> str:
 # GỬI TIN NHẮN TELEGRAM
 # ──────────────────────────────────────────────
 async def send_telegram(message: str):
-    """Gửi tin nhắn đến Telegram chat."""
-    try:
-        tg_bot = bot
-        assert tg_bot is not None
-        await tg_bot.send_message(chat_id=CHAT_ID, text=message)
-        log.info("✅ Đã gửi tín hiệu Telegram.")
-    except Exception as e:
-        log.error(f"❌ Lỗi gửi Telegram: {e}")
+    """Gửi tin nhắn đồng loạt tới tất cả recipients đã đăng ký."""
+    tg_bot = bot
+    assert tg_bot is not None
+
+    recipients = get_broadcast_chat_ids()
+    if not recipients:
+        log.warning("Không có subscriber nào để gửi tín hiệu.")
+        return
+
+    success_count = 0
+    error_count = 0
+    for chat_id in recipients:
+        try:
+            await tg_bot.send_message(chat_id=chat_id, text=message)
+            success_count += 1
+        except Exception as e:
+            log.error(f"❌ Lỗi gửi Telegram tới {chat_id}: {e}")
+            error_count += 1
+
+    log.info(f"✅ Gửi tín hiệu hoàn tất: tổng {len(recipients)}, thành công {success_count}, lỗi {error_count}.")
 
 
 # ──────────────────────────────────────────────
@@ -482,7 +866,7 @@ async def scan_symbol(symbol: str) -> str | None:
         return None
 
     # 2) Kiểm tra điều kiện nến 4H
-    candle_info = check_candle_conditions(df_4h)
+    candle_info = check_candle_conditions(df_4h, symbol)
     if candle_info is None:
         return None
 
@@ -656,9 +1040,22 @@ async def scheduled_daily_summary_scan():
     await run_daily_summary_scan()
 
 
+async def scheduled_sync_subscribers():
+    """Đồng bộ command Telegram định kỳ khi bot chạy service mode."""
+    await sync_telegram_subscribers()
+
+
 def setup_scheduler() -> AsyncIOScheduler:
     """Cấu hình APScheduler chạy mỗi 4h."""
     scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.add_job(
+        scheduled_sync_subscribers,
+        "interval",
+        seconds=30,
+        id="telegram_subscriber_sync",
+        name="Đồng bộ Telegram subscriber mỗi 30 giây",
+        misfire_grace_time=120,
+    )
     scheduler.add_job(
         scheduled_scan,
         "cron",
@@ -688,13 +1085,15 @@ def setup_scheduler() -> AsyncIOScheduler:
 async def run_service_mode():
     await init()
 
-    # Chạy quét ngay lần đầu để test
-    log.info("🔥 Chạy quét lần đầu (test)...")
-    await run_scan()
+    await sync_telegram_subscribers()
 
-    # Setup scheduler
+    # Setup scheduler trước để bắt đầu lắng nghe Telegram ngay lập tức
     scheduler = setup_scheduler()
     scheduler.start()
+
+    # Chạy quét ngay lần đầu để test (chạy ẩn dưới nền để không block lệnh chat)
+    log.info("🔥 Chạy quét lần đầu (test)...")
+    asyncio.create_task(run_scan())
 
     next_runs = scheduler.get_jobs()
     for job in next_runs:
@@ -717,6 +1116,7 @@ async def run_once_mode():
     """Chạy 1 vòng quét rồi thoát (phù hợp cho job theo lịch)."""
     await init()
     try:
+        await sync_telegram_subscribers()
         await run_scan()
 
         # Nếu job chạy vào 00:00 UTC (07:00 UTC+7), gửi thêm tổng hợp D1.

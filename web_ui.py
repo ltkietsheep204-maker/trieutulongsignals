@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -12,9 +13,9 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib import parse, request
 
 from env_loader import read_env_file, write_env_file
+from telegram import Bot
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -108,6 +109,7 @@ HTML_PAGE = """<!doctype html>
     }
     .panel {
       padding: 16px;
+      min-width: 0;
     }
     .panel h2 {
       margin: 0 0 12px;
@@ -116,6 +118,7 @@ HTML_PAGE = """<!doctype html>
     .stack {
       display: grid;
       gap: 16px;
+      min-width: 0;
     }
     label {
       display: block;
@@ -136,6 +139,19 @@ HTML_PAGE = """<!doctype html>
       display: flex;
       gap: 10px;
       flex-wrap: wrap;
+      align-items: stretch;
+    }
+    .row > * {
+      min-width: 0;
+    }
+    .button-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+    }
+    .button-grid > * {
+      width: 100%;
+      min-width: 0;
     }
     button {
       appearance: none;
@@ -146,6 +162,8 @@ HTML_PAGE = """<!doctype html>
       padding: 10px 14px;
       font-size: 14px;
       cursor: pointer;
+      white-space: normal;
+      overflow-wrap: anywhere;
     }
     button.primary { background: var(--accent); border-color: var(--accent); color: white; }
     button.good { background: var(--good); border-color: var(--good); color: white; }
@@ -200,6 +218,30 @@ HTML_PAGE = """<!doctype html>
         width: 100%;
       }
     }
+    @media (max-width: 720px) {
+      .app {
+        padding: 12px;
+      }
+      .panel {
+        padding: 12px;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 1fr;
+      }
+      .row > * {
+        width: 100%;
+      }
+      .button-grid {
+        grid-template-columns: 1fr;
+      }
+      button {
+        width: 100%;
+      }
+      pre {
+        min-height: 420px;
+      }
+    }
   </style>
 </head>
 <body>
@@ -228,7 +270,7 @@ HTML_PAGE = """<!doctype html>
             <label for="chat-id">Chat ID</label>
             <input id="chat-id" type="text" autocomplete="off">
           </div>
-          <div class="row" style="margin-top: 12px;">
+          <div class="button-grid" style="margin-top: 12px;">
             <button id="toggle-token">Hiện token</button>
             <button id="save-config" class="primary">Lưu cấu hình</button>
             <button id="reload-config">Đọc lại .env</button>
@@ -239,7 +281,7 @@ HTML_PAGE = """<!doctype html>
 
         <section class="panel">
           <h2>Điều khiển Bot</h2>
-          <div class="row">
+          <div class="button-grid">
             <button id="start-service" class="good">Start Service</button>
             <button id="run-once" class="warn">Run Once</button>
             <button id="stop-bot" class="bad">Stop</button>
@@ -487,27 +529,23 @@ class BotRuntime:
             "Nguon gui: localhost web_ui.py\n"
             "Muc dich: xac nhan bot gui duoc tin nhan."
         )
-        payload = parse.urlencode(
-            {
-                "chat_id": telegram_chat_id,
-                "text": message,
-            }
-        ).encode("utf-8")
-        api_url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
-        req = request.Request(api_url, data=payload, method="POST")
 
         try:
-            with request.urlopen(req, timeout=20) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
+            asyncio.run(self._send_test_message(telegram_token, telegram_chat_id, message))
         except Exception as exc:
             self._append_system_log(f"Test Telegram lỗi: {exc}")
             raise RuntimeError(f"Gửi test Telegram thất bại: {exc}") from exc
 
-        if '"ok":true' not in body.replace(" ", "").lower():
-            self._append_system_log(f"Test Telegram phản hồi lỗi: {body}")
-            raise RuntimeError("Telegram API không xác nhận thành công.")
-
         self._append_system_log("Đã gửi tin nhắn test Telegram thành công.")
+
+    async def _send_test_message(
+        self,
+        telegram_token: str,
+        telegram_chat_id: str,
+        message: str,
+    ) -> None:
+        bot = Bot(token=telegram_token)
+        await bot.send_message(chat_id=telegram_chat_id, text=message)
 
     def clear_logs(self) -> None:
         with self.lock:
