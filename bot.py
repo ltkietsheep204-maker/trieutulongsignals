@@ -1025,17 +1025,41 @@ def get_4h_cron_hours() -> str:
 
 
 async def scheduled_scan():
-    """Wrapper cho scheduler — thêm delay nhỏ để nến đóng."""
+    """Wrapper cho scheduler — thêm delay nhỏ để nến đóng và có cơ chế auto-retry."""
     log.info("⏰ Scheduler triggered — chờ 15s cho nến 4H đóng...")
     await asyncio.sleep(15)
-    await run_scan()
+    
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            await run_scan()
+            break
+        except Exception as e:
+            log.error(f"⚠️ Lỗi quét H4 lần {attempt}/{max_retries}: {e}")
+            if attempt < max_retries:
+                log.info("⏳ Thử lại sau 10 giây...")
+                await asyncio.sleep(10)
+            else:
+                log.error("❌ Quét H4 thất bại sau 3 lần thử.")
 
 
 async def scheduled_daily_summary_scan():
-    """Chạy tổng hợp D1 sau khi nến ngày vừa đóng tại 00:00 UTC (07:00 UTC+7)."""
+    """Chạy tổng hợp D1 sau khi nến ngày vừa đóng tại 00:00 UTC (07:00 UTC+7) với auto-retry."""
     log.info("⏰ Daily D1 scheduler triggered — chờ 20s cho nến ngày đóng...")
     await asyncio.sleep(20)
-    await run_daily_summary_scan()
+    
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            await run_daily_summary_scan()
+            break
+        except Exception as e:
+            log.error(f"⚠️ Lỗi quét D1 lần {attempt}/{max_retries}: {e}")
+            if attempt < max_retries:
+                log.info("⏳ Thử lại sau 10 giây...")
+                await asyncio.sleep(10)
+            else:
+                log.error("❌ Quét D1 thất bại sau 3 lần thử.")
 
 
 async def scheduled_sync_subscribers():
