@@ -59,7 +59,7 @@ ALT_RANGE_PERCENT_MIN = 0.05   # Nhánh bổ sung: Range từ 5% đến 10%
 ALT_VOLUME_SPIKE_MULTIPLIER = 3.0  # Nhánh bổ sung: Volume >= 3x nến trước
 ALT_BODY_RATIO_MIN = 0.80      # Nhánh 5-10%: Body >= 80% tổng chiều dài nến
 MIN_FUTURES_QUOTE_VOLUME_24H = 5_000_000   # 24h quote volume tối thiểu (USDT)
-PREVIOUS_H4_GREEN_RANGE_MAX = 0.045        # Filter cho H4 liền kề trước đó
+PREVIOUS_H4_SAME_COLOR_RANGE_MAX = 0.045   # Filter cho H4 liền kề trước đó
 
 # Điều kiện tổng hợp D1 lúc 07:00 UTC+7 (tức 00:00 UTC)
 D1_BODY_RATIO_MIN = 0.60       # Body > 60% tổng chiều dài nến D1
@@ -534,6 +534,7 @@ def passes_directional_wick_rule(o: float, h: float, l: float, c: float) -> bool
 
 
 def passes_previous_h4_candle_filter(
+    is_bullish: bool,
     prev_open: float,
     prev_high: float,
     prev_low: float,
@@ -541,25 +542,22 @@ def passes_previous_h4_candle_filter(
 ) -> bool:
     """
     Kiểm tra nến H4 liền kề trước đó.
-    1. Đỏ (close < open): hợp lệ.
-    2. Xanh (close > open): hợp lệ nếu range <= 4.5%.
+    1. Nếu ngược màu với nến hiện tại: hợp lệ.
+    2. Nếu cùng màu với nến hiện tại: hợp lệ nếu range <= 4.5%.
     3. Doji (close == open): không hợp lệ.
     """
-    if prev_open <= 0:
+    if prev_open <= 0 or prev_close == prev_open:
         return False
 
+    prev_is_bullish = prev_close > prev_open
     prev_range_pct = (prev_high - prev_low) / prev_open
 
-    # Nến trước đỏ: hợp lệ luôn
-    if prev_close < prev_open:
-        return True
+    # Cùng màu
+    if is_bullish == prev_is_bullish:
+        return prev_range_pct <= PREVIOUS_H4_SAME_COLOR_RANGE_MAX
 
-    # Nến trước xanh: chỉ hợp lệ nếu range <= 4.5%
-    if prev_close > prev_open:
-        return prev_range_pct <= PREVIOUS_H4_GREEN_RANGE_MAX
-
-    # Doji: không hợp lệ
-    return False
+    # Khác màu
+    return True
 
 
 # ──────────────────────────────────────────────
@@ -629,11 +627,11 @@ def check_candle_conditions(df_4h: pd.DataFrame, symbol: str = "") -> dict | Non
     is_bullish = c > o
 
     # Lọc nến H4 liền trước (Reversal filter)
-    if not passes_previous_h4_candle_filter(prev_o, prev_h, prev_l, prev_c):
+    if not passes_previous_h4_candle_filter(is_bullish, prev_o, prev_h, prev_l, prev_c):
         symbol_prefix = f"{symbol}: " if symbol else ""
         log.info(
             f"Rejected {symbol_prefix}previous H4 candle filter failed | "
-            f"prev_open={prev_o} prev_high={prev_h} prev_low={prev_l} prev_close={prev_c} "
+            f"is_bullish={is_bullish} prev_open={prev_o} prev_high={prev_h} prev_low={prev_l} prev_close={prev_c} "
             f"prev_range_pct={(prev_h - prev_l) / prev_o:.2%}"
         )
         return None
